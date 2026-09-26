@@ -3,8 +3,7 @@
 Evidence and material for a patch series that makes typing in long TeXmacs documents
 2–4× cheaper (continuous page mode).
 
-* Pull request: <!--PR-->
-* Savannah patch: <!--SAVANNAH-->
+* Pull request: https://github.com/texmacs/texmacs/pull/112
 * Full technical report: [REPORT.md](REPORT.md)
 * The patches: [patches/](patches/) (against the `development` branch; they also apply to
   current trunk)
@@ -15,7 +14,23 @@ Each video shows the unpatched build on the left and the patched build on the ri
 same key is sent to both at the same moment, one every 60 ms. Watch the right-hand corner
 tags: when "last key sent" appears, the unpatched side is still catching up.
 
-<!--VIDEOS-->
+**Lecture notes, 3,500 paragraphs with figures, typing near the start** (TeXmacs 2.1.4 vs 2.1.4 + series)
+
+[![notes, typing](previews/notes-B-top-lorem.gif)](videos/notes-B-top-lorem.mp4)
+
+**Same notes, typing text with Return**
+
+[![notes, Return](previews/notes-B-top-enter.gif)](videos/notes-B-top-enter.mp4)
+
+**Synthetic document, 3,500 paragraphs with figures and footnotes, typing with Return** (trunk vs trunk + series)
+
+[![synthetic, Return](previews/synth-3500f-top-enter.gif)](videos/synth-3500f-top-enter.mp4)
+
+**Synthetic document, 2,000 paragraphs, typing near the start**
+
+[![synthetic, typing](previews/synth-2000-top-lorem.gif)](videos/synth-2000-top-lorem.mp4)
+
+(The previews are 8 fps GIFs; click one for the full video.)
 
 | video | unpatched | patched (CPU per key) |
 |---|---|---|
