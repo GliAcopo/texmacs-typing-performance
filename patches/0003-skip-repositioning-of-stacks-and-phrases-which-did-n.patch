@@ -1,0 +1,96 @@
+From 6a83db2d02a342a855573fcda3af28eb6933e099 Mon Sep 17 00:00:00 2001
+From: Gli_acopo <82150202+GliAcopo@users.noreply.github.com>
+Date: Sat, 26 Sep 2026 15:03:54 +0200
+Subject: [PATCH 03/10] skip repositioning of stacks and phrases which did not
+ move
+
+After every change, position_at walked all lines of the document to log
+the displacement of each phrase box, even though nearly all of them are
+at the same place as before (such pairs are discarded by requires_update).
+Remember the absolute position and change log of the last call in stack
+and phrase boxes, and return early when both are unchanged.
+---
+ src/Typeset/Boxes/Composite/concat_boxes.cpp |  2 ++
+ src/Typeset/Boxes/Composite/stack_boxes.cpp  | 19 ++++++++++++++++++-
+ src/Typeset/boxes.hpp                        |  1 +
+ 3 files changed, 21 insertions(+), 1 deletion(-)
+
+diff --git a/src/Typeset/Boxes/Composite/concat_boxes.cpp b/src/Typeset/Boxes/Composite/concat_boxes.cpp
+index a92970016..bd272cf9a 100644
+--- a/src/Typeset/Boxes/Composite/concat_boxes.cpp
++++ b/src/Typeset/Boxes/Composite/concat_boxes.cpp
+@@ -645,6 +645,8 @@ phrase_box_rep::~phrase_box_rep () {
+ void
+ phrase_box_rep::position_at (SI x, SI y, rectangles& logs) {
+   x += x0; y += y0;
++  // unchanged position: the logged pair would be discarded by requires_update
++  if (logs_ptr == &logs && ox == x && oy == y) return;
+   if (logs_ptr == NULL) logs= rectangles (rectangle (0, 0, 0, 0), logs);
+   else logs= rectangles (rectangle (ox+x3, oy+y3, ox+x4, oy+y4), logs);
+   ox= x; oy= y;
+diff --git a/src/Typeset/Boxes/Composite/stack_boxes.cpp b/src/Typeset/Boxes/Composite/stack_boxes.cpp
+index 895adf257..32db51480 100644
+--- a/src/Typeset/Boxes/Composite/stack_boxes.cpp
++++ b/src/Typeset/Boxes/Composite/stack_boxes.cpp
+@@ -16,6 +16,10 @@
+ ******************************************************************************/
+ 
+ struct stack_box_rep: public composite_box_rep {
++  // absolute position and change log of the last position_at call
++  SI          pos_x, pos_y;
++  rectangles* pos_logs;
++
+   stack_box_rep (path ip, array<box> bs, array<SI> spc); 
+   int get_type () { return STACK_BOX; }
+   operator tree () {
+@@ -27,6 +31,7 @@ struct stack_box_rep: public composite_box_rep {
+ 
+   void      position (array<SI> spc);
+   void      finalize ();
++  void      position_at (SI x, SI y, rectangles& change_log);
+   void      display (renderer ren);
+   void      clear_incomplete (rectangles& rs, SI pixel, int i, int i1, int i2);
+   bool      access_allowed ();
+@@ -56,7 +61,7 @@ stack_box_rep::position (array<SI> spc) {
+ }
+ 
+ stack_box_rep::stack_box_rep (path ip, array<box> bs2, array<SI> spc):
+-  composite_box_rep (ip)
++  composite_box_rep (ip), pos_x (0), pos_y (0), pos_logs (NULL)
+ {
+   bs= bs2;
+   if (N(bs) != 0)
+@@ -64,6 +69,18 @@ stack_box_rep::stack_box_rep (path ip, array<box> bs2, array<SI> spc):
+   finalize ();
+ }
+ 
++void
++stack_box_rep::position_at (SI x, SI y, rectangles& change_log) {
++  // Boxes are not modified once built, so if this stack was already placed
++  // at the same absolute position for the same change log, all phrase boxes
++  // inside it are up to date and there is nothing to log.  This avoids
++  // walking all the lines of a long document at every typesetting pass.
++  SI ax= x + x0, ay= y + y0;
++  if (pos_logs == &change_log && pos_x == ax && pos_y == ay) return;
++  pos_logs= &change_log; pos_x= ax; pos_y= ay;
++  box_rep::position_at (x, y, change_log);
++}
++
+ void
+ stack_box_rep::finalize () {
+   path old_ip= ip;
+diff --git a/src/Typeset/boxes.hpp b/src/Typeset/boxes.hpp
+index 4dd67fc24..6c80c08a7 100644
+--- a/src/Typeset/boxes.hpp
++++ b/src/Typeset/boxes.hpp
+@@ -264,6 +264,7 @@ public:
+   friend struct lazy_paragraph_rep;
+   friend class  phrase_box_rep;
+   friend class  remember_box_rep;
++  friend struct stack_box_rep;
+   friend struct effect_box_rep;
+   friend void make_eps (url dest, box b, int dpi);
+   friend void make_raster_image (url dest, box b, double zoom);
+-- 
+2.53.0
+

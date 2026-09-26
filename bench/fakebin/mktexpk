@@ -1,0 +1,4 @@
+#!/bin/sh
+# bench only: fail immediately instead of running metafont for fonts that cannot be built
+# (ecss4, bbmbx13, bbmbx15 at screen dpi), which otherwise freezes a repaint for ~20 s.
+exit 1

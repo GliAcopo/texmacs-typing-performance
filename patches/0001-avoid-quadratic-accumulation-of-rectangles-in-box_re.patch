@@ -1,0 +1,33 @@
+From dadff6d6ee22fdaccfb72b9b2e56a71ffcb758e4 Mon Sep 17 00:00:00 2001
+From: Gli_acopo <82150202+GliAcopo@users.noreply.github.com>
+Date: Sat, 26 Sep 2026 15:03:54 +0200
+Subject: [PATCH 01/10] avoid quadratic accumulation of rectangles in
+ box_rep::redraw
+
+The rectangles returned by the children were collected with l= ll * l,
+which copies both lists: quadratic (and deeply recursive) in the number
+of redrawn children.  Prepend them instead.
+---
+ src/Typeset/Boxes/Basic/boxes.cpp | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/src/Typeset/Boxes/Basic/boxes.cpp b/src/Typeset/Boxes/Basic/boxes.cpp
+index fc915bd40..54c46bff6 100644
+--- a/src/Typeset/Boxes/Basic/boxes.cpp
++++ b/src/Typeset/Boxes/Basic/boxes.cpp
+@@ -564,8 +564,10 @@ box_rep::redraw (renderer ren, path p, rectangles& l) {
+       if (!is_nil(ll)) {
+         i1= min (i1, k);
+         i2= max (i2, k);
+-        l = ll * l;
+-        ll= rectangles ();
++        // Prepend the new rectangles instead of "l= ll * l": list concatenation
++        // copies both operands (recursively), which made this loop quadratic
++        // (and deeply recursive) in the number of redrawn children.
++        for (; !is_nil (ll); ll= ll->next) l= rectangles (ll->item, l);
+       }
+     }
+     
+-- 
+2.53.0
+

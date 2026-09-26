@@ -1,0 +1,24 @@
+== notes-A-top-lorem
+TeXmacs 2.1.4 (Ubuntu)       cpu   58.6 ms/key (8790 ms for 150 keys), busy until  0.50 s after the last key
+2.1.4 + patches              cpu   30.9 ms/key (4630 ms for 150 keys), busy until  0.50 s after the last key
+== notes-B-top-lorem
+TeXmacs 2.1.4 (Ubuntu)       cpu   80.5 ms/key (12080 ms for 150 keys), busy until  3.26 s after the last key
+2.1.4 + patches              cpu   47.3 ms/key (7090 ms for 150 keys), busy until  1.25 s after the last key
+== notes-B-top-enter
+TeXmacs 2.1.4 (Ubuntu)       cpu   98.5 ms/key (8270 ms for 84 keys), busy until  3.76 s after the last key
+2.1.4 + patches              cpu   49.2 ms/key (4130 ms for 84 keys), busy until  0.75 s after the last key
+== synth-2000-top-lorem
+TeXmacs trunk                cpu   57.4 ms/key (8610 ms for 150 keys), busy until  0.75 s after the last key
+trunk + patches              cpu   24.7 ms/key (3710 ms for 150 keys), busy until  0.50 s after the last key
+== synth-2000-end-lorem
+TeXmacs trunk                cpu   56.0 ms/key (8400 ms for 150 keys), busy until  0.75 s after the last key
+trunk + patches              cpu   22.1 ms/key (3310 ms for 150 keys), busy until  0.50 s after the last key
+== synth-3500f-top-lorem
+TeXmacs trunk                cpu   61.7 ms/key (9250 ms for 150 keys), busy until  0.75 s after the last key
+trunk + patches              cpu   30.9 ms/key (4630 ms for 150 keys), busy until  0.50 s after the last key
+== synth-3500f-top-enter
+TeXmacs trunk                cpu   83.3 ms/key (7000 ms for 84 keys), busy until  2.25 s after the last key
+trunk + patches              cpu   36.2 ms/key (3040 ms for 84 keys), busy until  0.50 s after the last key
+== synth-2000-paper-lorem (paper page mode, measured without video)
+TeXmacs trunk                cpu   63.0 ms/key (9450 ms for 150 keys), busy until  0.75 s after the last key
+trunk + patches              cpu   62.4 ms/key (9360 ms for 150 keys), busy until  0.75 s after the last key

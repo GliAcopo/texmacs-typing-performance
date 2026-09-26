@@ -1,0 +1,91 @@
+From 85f86c6084f11179d170ab5766832a547f605f02 Mon Sep 17 00:00:00 2001
+From: Gli_acopo <82150202+GliAcopo@users.noreply.github.com>
+Date: Sat, 26 Sep 2026 15:03:55 +0200
+Subject: [PATCH 10/10] cheaper tm-func? on trees and title/abstract proposal
+ predicates
+
+tm-func? converted compound trees to lists (O(arity)), which is costly
+for the document root; test label and arity directly.  The focus toolbar
+evaluates document-propose-title?/abstract? after every change: test the
+cursor first and scan the document without building lists.
+---
+ TeXmacs/progs/kernel/library/content.scm | 14 +++++++++--
+ TeXmacs/progs/text/text-edit.scm         | 32 +++++++++++++++---------
+ 2 files changed, 32 insertions(+), 14 deletions(-)
+
+diff --git a/TeXmacs/progs/kernel/library/content.scm b/TeXmacs/progs/kernel/library/content.scm
+index 42f544960..c4bddf1f2 100644
+--- a/TeXmacs/progs/kernel/library/content.scm
++++ b/TeXmacs/progs/kernel/library/content.scm
+@@ -86,8 +86,18 @@
+ 	(else (cons (tm-car x) (sublist (tm-cdr x) from to)))))
+ 
+ (define-public (tm-func? x . args)
+-  (or (and (list? x) (apply func? (cons x args)))
+-      (and (compound-tree? x) (apply func? (cons (tree->list x) args)))))
++  (cond ((list? x) (apply func? (cons x args)))
++        ((compound-tree? x)
++         ;; Test label and arity directly: converting the tree with tree->list
++         ;; costs O(arity), which is paid on every keystroke when predicates
++         ;; such as db-field-any? are tried on the document root.
++         (cond ((null? args) #f)
++               ((null? (cdr args)) (== (tree-label x) (car args)))
++               ((null? (cddr args))
++                (and (== (tree-label x) (car args))
++                     (= (tree-arity x) (cadr args))))
++               (else (apply func? (cons (tree->list x) args)))))
++        (else #f)))
+ 
+ (define-public (tm-is? x lab)
+   (or (and (pair? x) (== (car x) lab))
+diff --git a/TeXmacs/progs/text/text-edit.scm b/TeXmacs/progs/text/text-edit.scm
+index 5eea5770b..03e1526ec 100644
+--- a/TeXmacs/progs/text/text-edit.scm
++++ b/TeXmacs/progs/text/text-edit.scm
+@@ -30,23 +30,31 @@
+ ;; Inserting a title and an abstract
+ ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+ 
++(define (document-has-child-label? bt lab)
++  ;; like (in? lab (map tree-label (tree-children bt))) without building lists
++  (let loop ((i (- (tree-arity bt) 1)))
++    (and (>= i 0)
++         (or (== (tree-label (tree-ref bt i)) lab)
++             (loop (- i 1))))))
++
++;; The cheap cursor test goes first: these predicates are evaluated by the
++;; focus toolbar after every change, and scanning all paragraphs of a long
++;; document each time is noticeable.
+ (tm-define (document-propose-title?)
+   (with bt (buffer-tree)
+-    (with brothers (map tree-label (tree-children bt))
+-      (and-with t (tree-ref bt :down)
+-        (and (tree-is? bt 'document)
+-	     (match? (cursor-tree) "")
+-	     (not (in? 'doc-data brothers))
+-             (not (style-has? "beamer-style")))))))
++    (and (tree-is? bt 'document)
++         (match? (cursor-tree) "")
++         (and-with t (tree-ref bt :down)
++           (and (not (document-has-child-label? bt 'doc-data))
++                (not (style-has? "beamer-style")))))))
+ 
+ (tm-define (document-propose-abstract?)
+   (with bt (buffer-tree)
+-    (with brothers (map tree-label (tree-children bt))
+-      (and-with t (tree-ref bt :down)
+-        (and (tree-is? bt 'document)
+-	     (match? (cursor-tree) "")
+-             (in? 'doc-data brothers)
+-	     (not (in? 'abstract-data brothers)))))))
++    (and (tree-is? bt 'document)
++         (match? (cursor-tree) "")
++         (and-with t (tree-ref bt :down)
++           (and (document-has-child-label? bt 'doc-data)
++                (not (document-has-child-label? bt 'abstract-data)))))))
+ 
+ ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+ ;; Inserting document, author and abstract data
+-- 
+2.53.0
+

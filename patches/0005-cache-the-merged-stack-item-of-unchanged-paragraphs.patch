@@ -1,0 +1,78 @@
+From 9bfc042e419c33f738485c4f5dfeb0ffca723299 Mon Sep 17 00:00:00 2001
+From: Gli_acopo <82150202+GliAcopo@users.noreply.github.com>
+Date: Sat, 26 Sep 2026 15:03:54 +0200
+Subject: [PATCH 05/10] cache the merged stack item of unchanged paragraphs
+
+Outside paper mode, bridge_rep::typeset merges the lines of a paragraph
+into a single stack box at every pass, even when the paragraph was not
+retypeset.  Keep the merged item until the lines are recomputed, and
+give bridges a version number which is incremented at each recomputation
+(used by the next commit).
+---
+ src/Typeset/Bridge/bridge.cpp | 9 ++++++++-
+ src/Typeset/Bridge/bridge.hpp | 8 ++++++++
+ 2 files changed, 16 insertions(+), 1 deletion(-)
+
+diff --git a/src/Typeset/Bridge/bridge.cpp b/src/Typeset/Bridge/bridge.cpp
+index 318848ff6..0d0687542 100644
+--- a/src/Typeset/Bridge/bridge.cpp
++++ b/src/Typeset/Bridge/bridge.cpp
+@@ -38,7 +38,7 @@ bridge nil_bridge;
+ 
+ bridge_rep::bridge_rep (typesetter ttt2, tree st2, path ip2):
+   ttt (ttt2), env (ttt->env), st (st2), ip (ip2),
+-  status (CORRUPTED), changes (UNINIT) {}
++  status (CORRUPTED), changes (UNINIT), stack_cache_ok (false), version (0) {}
+ 
+ static tree inactive_auto
+   (MACRO, "x", tree (REWRITE_INACTIVE, tree (ARG, "x"), "recurse*"));
+@@ -325,6 +325,8 @@ bridge_rep::typeset (int desired_status) {
+     ttt->local_end (l, sb);
+     env->link_env= old_link_env;
+     status= desired_status;
++    stack_cache_ok= false;
++    version++;
+     // cout << "old_patch     = " << ttt->old_patch << LF;
+     // cout << "changes       = " << changes << LF;
+     // cout << UNINDENT << "Typesetted " << st << ", " << desired_status << LF;
+@@ -334,6 +336,8 @@ bridge_rep::typeset (int desired_status) {
+   // ttt->insert_stack (l, sb);
+   //if (N(l) == 0); else
+   if (ttt->paper || (N(l) <= 1)) ttt->insert_stack (l, sb);
++  else if (stack_cache_ok && strong_equal (ip, stack_cache_ip))
++    ttt->insert_stack (stack_cache, sb);
+   else {
+     bool flag= false;
+     int i, n= N(l);
+@@ -363,6 +367,9 @@ bridge_rep::typeset (int desired_status) {
+       new_l[0]= page_item (lb);
+       new_l[0]->spc= l[last]->spc;
+       new_l << special_l;
++      stack_cache= new_l;
++      stack_cache_ip= ip;
++      stack_cache_ok= true;
+       ttt->insert_stack (new_l, sb);
+     }
+   }
+diff --git a/src/Typeset/Bridge/bridge.hpp b/src/Typeset/Bridge/bridge.hpp
+index 711f8d271..5f2e90fb2 100644
+--- a/src/Typeset/Bridge/bridge.hpp
++++ b/src/Typeset/Bridge/bridge.hpp
+@@ -45,6 +45,14 @@ public:
+   stack_border         sb;       // border properties of l
+   link_repository      link_env; // loci and links declared inside bridge
+ 
++  // Cache of the single stack item into which l is merged outside paper
++  // mode; rebuilding it for every paragraph at every typesetting pass made
++  // the cost of a keystroke linear in the size of the document.
++  array<page_item>     stack_cache;
++  path                 stack_cache_ip;
++  bool                 stack_cache_ok;
++  int                  version;  // incremented whenever l is recomputed
++
+ public:
+   bridge_rep (typesetter ttt, tree st, path ip);
+   inline virtual ~bridge_rep () {}
+-- 
+2.53.0
+

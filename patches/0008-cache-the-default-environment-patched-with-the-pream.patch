@@ -1,0 +1,126 @@
+From ed5e6e2970d9da2520b67c7c9e6ab420f912cf49 Mon Sep 17 00:00:00 2001
+From: Gli_acopo <82150202+GliAcopo@users.noreply.github.com>
+Date: Sat, 26 Sep 2026 15:03:54 +0200
+Subject: [PATCH 08/10] cache the default environment patched with the preamble
+
+typeset_prepare rewrote the default environment and patched it with the
+complete environment after the style (thousands of variables) at every
+typesetting pass and every get-env.  Keep the patched environment until
+the preamble changes (pre_version), and only redo the updates of the
+variables whose assignment has side effects on the edit_env state.
+---
+ src/Edit/Editor/edit_typeset.cpp | 24 +++++++++++++++++++++---
+ src/Edit/Editor/edit_typeset.hpp |  4 ++++
+ src/Typeset/Env/env.cpp          | 12 ++++++++++++
+ src/Typeset/env.hpp              |  1 +
+ 4 files changed, 38 insertions(+), 3 deletions(-)
+
+diff --git a/src/Edit/Editor/edit_typeset.cpp b/src/Edit/Editor/edit_typeset.cpp
+index 8430460e1..51f344cb9 100644
+--- a/src/Edit/Editor/edit_typeset.cpp
++++ b/src/Edit/Editor/edit_typeset.cpp
+@@ -35,7 +35,8 @@ edit_typeset_rep::edit_typeset_rep ():
+   editor_rep (), // NOTE: ignored by the compiler, but suppresses warning
+   the_style (TUPLE),
+   cur (hashmap<string,tree> (UNINIT)),
+-  stydef (UNINIT), pre (UNINIT), init (UNINIT), fin (UNINIT), grefs (UNINIT),
++  stydef (UNINIT), pre (UNINIT), pre_version (0), prep_version (-1),
++  prep_env (UNINIT), init (UNINIT), fin (UNINIT), grefs (UNINIT),
+   env (drd, buf->buf->master,
+        buf->data->ref, (buf->prj==NULL? grefs: buf->prj->data->ref),
+        buf->data->aux, (buf->prj==NULL? buf->data->aux: buf->prj->data->aux),
+@@ -298,6 +299,7 @@ edit_typeset_rep::typeset_preamble () {
+   env->patch_env (init);
+   env->update ();
+   env->read_env (pre);
++  pre_version++;
+   drd->heuristic_init (pre);
+ }
+ 
+@@ -305,8 +307,23 @@ void
+ edit_typeset_rep::typeset_prepare () {
+   env->base_file_name= buf->buf->master;
+   env->read_only= buf->buf->read_only;
+-  env->write_default_env ();
+-  env->patch_env (pre);
++  // pre is the complete environment after the style and the initial
++  // settings, so patching the default environment with it rewrites thousands
++  // of variables; this happens at every typesetting pass and every get-env.
++  // Keep the patched environment and only redo the updates of the variables
++  // whose assignment has side effects on the edit_env state.
++  if (prep_version != pre_version) {
++    env->write_default_env ();
++    env->patch_env (pre);
++    env->read_env (prep_env);
++    prep_active= array<string> ();
++    env->active_vars (pre, prep_active);
++    prep_version= pre_version;
++  }
++  else {
++    env->write_env (prep_env);
++    for (int i=0; i<N(prep_active); i++) env->update (prep_active[i]);
++  }
+   env->style_init_env ();
+   env->update ();
+ }
+@@ -960,6 +977,7 @@ edit_typeset_rep::init_default (string var) {
+   init->reset (var);
+   if (stydef->contains (var)) pre(var)= stydef[var];
+   else pre->reset (var);
++  pre_version++;
+   notify_change (THE_ENVIRONMENT);
+ }
+ 
+diff --git a/src/Edit/Editor/edit_typeset.hpp b/src/Edit/Editor/edit_typeset.hpp
+index 6aeac1254..db44dceaa 100644
+--- a/src/Edit/Editor/edit_typeset.hpp
++++ b/src/Edit/Editor/edit_typeset.hpp
+@@ -23,6 +23,10 @@ protected:
+   hashmap<path,hashmap<string,tree> > cur; // environment at different paths
+   hashmap<string,tree> stydef;            // environment after styles
+   hashmap<string,tree> pre;               // environment after styles and init
++  int                  pre_version;       // incremented whenever pre changes
++  int                  prep_version;      // pre_version of prep_env
++  hashmap<string,tree> prep_env;          // default env patched with pre
++  array<string>        prep_active;       // active variables of pre
+   hashmap<string,tree> init;              // environment changes w.r.t. style
+   hashmap<string,tree> fin;               // environment changes w.r.t. doc
+   hashmap<string,tree> grefs;             // global references
+diff --git a/src/Typeset/Env/env.cpp b/src/Typeset/Env/env.cpp
+index d7b73a659..3b72fb476 100644
+--- a/src/Typeset/Env/env.cpp
++++ b/src/Typeset/Env/env.cpp
+@@ -175,6 +175,18 @@ edit_env_rep::patch_env (hashmap<string,tree> patch) {
+   }
+ }
+ 
++void
++edit_env_rep::active_vars (hashmap<string,tree> patch, array<string>& vars) {
++  // the variables of patch, in the order used by patch_env, for which
++  // write_update does more than storing the value
++  int i=0, n=patch->n;
++  for (; i<n; i++) {
++    list<hashentry<string,tree> > l=patch->a[i];
++    for (; !is_nil(l); l=l->next)
++      if (var_type[l->item.key] != Env_User) vars << l->item.key;
++  }
++}
++
+ void
+ edit_env_rep::read_env (hashmap<string,tree>& ret) {
+   ret= copy (env);
+diff --git a/src/Typeset/env.hpp b/src/Typeset/env.hpp
+index 55a0bf591..3f29618d0 100644
+--- a/src/Typeset/env.hpp
++++ b/src/Typeset/env.hpp
+@@ -479,6 +479,7 @@ public:
+   void write_env (hashmap<string,tree> user_env);
+   void monitored_patch_env (hashmap<string,tree> patch);
+   void patch_env (hashmap<string,tree> patch);
++  void active_vars (hashmap<string,tree> patch, array<string>& vars);
+   void read_env (hashmap<string,tree>& ret);
+   void local_start (hashmap<string,tree>& prev_back);
+   void local_update (hashmap<string,tree>& oldpat, hashmap<string,tree>& chg);
+-- 
+2.53.0
+
