@@ -4,6 +4,7 @@ Evidence and material for a patch series that makes typing in long TeXmacs docum
 2–4× cheaper (continuous page mode).
 
 * Pull request: https://github.com/texmacs/texmacs/pull/112
+* Savannah patch: https://savannah.gnu.org/patch/?10633 (same series, one file)
 * Full technical report: [REPORT.md](REPORT.md)
 * The patches: [patches/](patches/) (against the `development` branch; they also apply to
   current trunk)
