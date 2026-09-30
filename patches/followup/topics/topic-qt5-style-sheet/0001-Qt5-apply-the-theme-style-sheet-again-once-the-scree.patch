@@ -1,0 +1,35 @@
+From 2d89422eef79580a3a02cac9f036a3611aead49e Mon Sep 17 00:00:00 2001
+From: Gli_acopo <82150202+GliAcopo@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 17:18:47 +0200
+Subject: [PATCH] Qt5: apply the theme style sheet again once the screen
+ scaling is known
+
+The style sheet of the GUI theme is applied when the Qt application is
+created (QTMApplication::load), before the constructor of qt_gui_rep
+determines the scaling for high resolution screens.  Its sizes in px are
+therefore scaled by 1 instead of retina_scale (1.6666 on a 2560x1600
+screen with a theme), and the text of menus and toolbars is much smaller
+than in TeXmacs 2.1.4, which applied the style sheet at the end of the
+initialization.  Apply it again right after retina_scale is determined.
+---
+ src/Plugins/Qt/qt_gui.cpp | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/src/Plugins/Qt/qt_gui.cpp b/src/Plugins/Qt/qt_gui.cpp
+index b87080428..ca3ef1381 100644
+--- a/src/Plugins/Qt/qt_gui.cpp
++++ b/src/Plugins/Qt/qt_gui.cpp
+@@ -207,6 +207,10 @@ needing_update (false)
+     retina_icons= get_user_preference ("retina-icons") == "on"? 2: 1;
+   if (has_user_preference ("retina-scale"))
+     retina_scale= as_double (get_user_preference ("retina-scale"));
++  // the style sheet of the theme was applied when the application was
++  // created (QTMApplication::load), when retina_scale was not yet known:
++  // apply it again, with its sizes scaled accordingly
++  if (!headless_mode && tm_style_sheet != "") init_style_sheet (qApp);
+ #endif
+ }
+ 
+-- 
+2.53.0
+

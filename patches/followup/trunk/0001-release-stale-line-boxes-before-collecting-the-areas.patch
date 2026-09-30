@@ -1,0 +1,101 @@
+From 35114db68b86c2eadbdd96a45bc9d23353bf160f Mon Sep 17 00:00:00 2001
+From: Gli_acopo <82150202+GliAcopo@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 13:39:26 +0200
+Subject: [PATCH 1/5] release stale line boxes before collecting the areas to
+ repaint
+
+A phrase box logs its area for repainting when it is destroyed.  Two
+caches of the series kept the lines of the previous typesetting pass
+alive: the shove memo (its previous generation lived until the next
+pass) and the merged stack item of a paragraph (kept after the paragraph
+was retypeset when it became a single line).  A removed line was then
+only erased from the screen at the next edit; typing a letter on a new
+line and deleting it left part of the letter visible.
+
+Drop the previous shove generation once the paragraphs are typeset,
+clear the stack item cache when the lines are recomputed, and drop the
+previous generation of line chunks after use.
+---
+ src/Typeset/Bridge/bridge.cpp     |  4 ++++
+ src/Typeset/Bridge/typesetter.cpp |  1 +
+ src/Typeset/Stack/stacker.cpp     | 11 ++++++++++-
+ src/Typeset/Stack/stacker.hpp     |  1 +
+ 4 files changed, 16 insertions(+), 1 deletion(-)
+
+diff --git a/src/Typeset/Bridge/bridge.cpp b/src/Typeset/Bridge/bridge.cpp
+index 400df57d1..8d5a43660 100644
+--- a/src/Typeset/Bridge/bridge.cpp
++++ b/src/Typeset/Bridge/bridge.cpp
+@@ -402,6 +402,7 @@ chunk_lines (bridge_rep* br, array<page_item> l) {
+     }
+     i= j;
+   }
++  cc->prev= hashmap<pointer,line_chunk> ();  // see stack_cache in typeset
+   return out;
+ }
+ 
+@@ -441,6 +442,9 @@ bridge_rep::typeset (int desired_status) {
+     ttt->local_end (l, sb);
+     env->link_env= old_link_env;
+     status= desired_status;
++    // release the old lines now: a phrase box logs the area to be repainted
++    // when it is destroyed, so a stale cache would leave it on the screen
++    stack_cache= array<page_item> ();
+     stack_cache_ok= false;
+     version++;
+     // cout << "old_patch     = " << ttt->old_patch << LF;
+diff --git a/src/Typeset/Bridge/typesetter.cpp b/src/Typeset/Bridge/typesetter.cpp
+index 93569ccb3..6219b1b92 100644
+--- a/src/Typeset/Bridge/typesetter.cpp
++++ b/src/Typeset/Bridge/typesetter.cpp
+@@ -166,6 +166,7 @@ typesetter_rep::typeset () {
+     env->touched  = hashmap<string,bool> (false);
+   }
+   br->typeset (PROCESSED+ WANTED_PARAGRAPH);
++  shove_cache_end_pass ();
+   pager ppp= tm_new<pager_rep> (br->ip, env, l);
+   box rb= ppp->make_pages ();
+   if (env->complete && paper) determine_page_references (rb);
+diff --git a/src/Typeset/Stack/stacker.cpp b/src/Typeset/Stack/stacker.cpp
+index f2d3b877d..4ae20494c 100644
+--- a/src/Typeset/Stack/stacker.cpp
++++ b/src/Typeset/Stack/stacker.cpp
+@@ -224,7 +224,11 @@ shove (page_item& item1, page_item& item2,
+ * immutable and shared between passes) and on a few border parameters, so
+ * its result is remembered.  Two generations of entries are kept (current
+ * and previous pass), which bounds the memory and keeps the referenced boxes
+-* alive, so that identity comparisons remain meaningful.
++* alive, so that identity comparisons remain meaningful.  The previous
++* generation is dropped as soon as the paragraphs have been typeset: boxes
++* log the area to be repainted when they are destroyed, so keeping the
++* lines of the previous pass alive until the next one would leave removed
++* lines on the screen.
+ ******************************************************************************/
+ 
+ struct shove_entry {
+@@ -242,6 +246,11 @@ shove_cache_new_pass () {
+   shove_cur = hashmap<pointer,shove_entry> ();
+ }
+ 
++void
++shove_cache_end_pass () {
++  shove_prev= hashmap<pointer,shove_entry> ();
++}
++
+ static void
+ cached_shove (page_item& item1, page_item& item2,
+               stack_border sb, stack_border sb2) {
+diff --git a/src/Typeset/Stack/stacker.hpp b/src/Typeset/Stack/stacker.hpp
+index cec51bfdc..20516377f 100644
+--- a/src/Typeset/Stack/stacker.hpp
++++ b/src/Typeset/Stack/stacker.hpp
+@@ -65,5 +65,6 @@ void merge_stack (array<page_item>& l, stack_border& sb,
+ 		  array<page_item> l2, stack_border sb2);
+ 
+ void shove_cache_new_pass ();
++void shove_cache_end_pass ();
+ 
+ #endif // defined STACKER_H
+-- 
+2.53.0
+

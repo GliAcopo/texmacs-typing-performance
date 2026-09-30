@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Pixel-exact comparison of two TeXmacs builds after the same edits.
 
-usage: verify-pixels.py <doc.tm> <launcher-1> <launcher-2> [pages] [--clean-home]
+usage: verify-pixels.py <doc.tm> <launcher-1> <launcher-2> [pages] [--clean-home] [--real-fonts]
+       [--pref1=key=value] [--pref2=key=value]   (user preference for build 1 / 2)
 
 Each build opens a scratch copy of the document on its own Xvfb, applies the fixed edit
 sequence of verify.scm (typing, Return, a new section near the top, math, backspace, joining
@@ -19,6 +20,7 @@ from PIL import Image, ImageChops
 P = os.path.expanduser("~/Projects/texmacs-perf")
 W = os.environ.get("TMBENCH_WORK", os.path.expanduser("~/.cache/tmbench"))
 args = [a for a in sys.argv[1:] if not a.startswith("--")]
+opts = dict(a[2:].split("=", 1) if "=" in a else (a[2:], "1") for a in sys.argv[1:] if a.startswith("--"))
 doc, launchers = os.path.abspath(args[0]), args[1:3]
 pages = int(args[3]) if len(args) > 3 else 40
 clean_home = "--clean-home" in sys.argv
@@ -80,6 +82,16 @@ def run(launcher, idx):
     else:
         subprocess.run(["rsync", "-a", "--exclude", "system/tmp", "--exclude", "system/boot_lock",
                         os.path.expanduser("~/.TeXmacs/"), home + "/"], check=True)
+    # saved window geometry is the one of the real screen: drop it; add --prefN=key=value
+    prefs = f"{home}/system/preferences.scm"
+    lines = open(prefs, encoding="latin-1").readlines() if os.path.exists(prefs) else []
+    lines = [l for l in lines if not l.startswith(('("abscissa ', '("ordinate ', '("width ', '("height '))]
+    extra = opts.get(f"pref{idx}")
+    if extra:
+        k, v = extra.split("=", 1)
+        lines = [l for l in lines if not l.startswith(f'("{k}" ')] + [f'("{k}" "{v}")\n']
+    os.makedirs(os.path.dirname(prefs), exist_ok=True)
+    open(prefs, "w", encoding="latin-1").writelines(lines)
     outdir = f"{W}/{tag}-shots"
     shutil.rmtree(outdir, ignore_errors=True); os.makedirs(outdir)
     ready, done, dump = (f"{W}/{tag}.{k}" for k in ("ready", "done", "dump"))
@@ -87,7 +99,8 @@ def run(launcher, idx):
         if os.path.exists(f): os.remove(f)
     disp = f":{93 + idx}"
     xvfb = start_xvfb(disp, GEOM)
-    env = dict(os.environ, PATH=P + "/bench/fakebin:" + os.environ["PATH"], DISPLAY=disp,
+    path = os.environ["PATH"] if "real-fonts" in opts else P + "/bench/fakebin:" + os.environ["PATH"]
+    env = dict(os.environ, PATH=path, DISPLAY=disp,
                QT_QPA_PLATFORM="xcb", WAYLAND_DISPLAY="", TEXMACS_HOME_PATH=home,
                TMVERIFY_OUT=dump, TMVERIFY_READY=ready, TMVERIFY_DONE=done)
     tm = subprocess.Popen([launcher, f"{ddir}/{os.path.basename(doc)}", "-x",

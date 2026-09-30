@@ -1,0 +1,226 @@
+From 48a9a4eb55cfaff09a6cd7f221813564f46f946d Mon Sep 17 00:00:00 2001
+From: Gli_acopo <82150202+GliAcopo@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 17:15:04 +0200
+Subject: [PATCH 3/5] only advance and repaint the animations which are on the
+ screen
+
+Once an animation (e.g. an animated gif inserted with <video>) had been
+displayed, the editor walked the whole box tree of the document twice per
+frame (anim_invalid and anim_next), forever, also after the animation left
+the screen: a long document with one animated gif used 75% of a core
+while idle, and every key cost about 115 ms instead of 12 ms.
+
+box_rep gets anim_next and anim_invalid restricted to a rectangle, which
+skip the boxes whose extents (with ink) miss it and pass it on to their
+children, translated.  Animation boxes check their own extents and then
+behave as before.  Transformed boxes and effect boxes do not cull their
+children by position (their children are transformed, or drawn beyond
+their extents), but still skip everything when they are not visible
+themselves.  The editor passes the visible part of the document.  When no
+visible animation needs repainting, animate() computes the next time
+itself (draw_text, which normally does, is not called then), so that the
+timer stops.  Animations which were skipped resynchronize when they are
+displayed again.
+---
+ src/Edit/Interface/edit_interface.cpp       | 25 +++++++++++---
+ src/Edit/Interface/edit_interface.hpp       |  1 +
+ src/Edit/Interface/edit_repaint.cpp         |  3 +-
+ src/Typeset/Boxes/Animate/animate_boxes.cpp | 12 +++++++
+ src/Typeset/Boxes/Basic/boxes.cpp           | 37 +++++++++++++++++++++
+ src/Typeset/Boxes/Modifier/change_boxes.cpp | 11 ++++++
+ src/Typeset/boxes.hpp                       |  3 ++
+ 7 files changed, 87 insertions(+), 5 deletions(-)
+
+diff --git a/src/Edit/Interface/edit_interface.cpp b/src/Edit/Interface/edit_interface.cpp
+index 7faa274b3..5a5aead14 100644
+--- a/src/Edit/Interface/edit_interface.cpp
++++ b/src/Edit/Interface/edit_interface.cpp
+@@ -197,6 +197,15 @@ edit_interface_rep::invalidate_all () {
+   send_invalidate_all (this);
+ }
+ 
++rectangle
++edit_interface_rep::visible_part () {
++  // the part of the document on the screen (animations elsewhere are
++  // neither advanced nor repainted)
++  update_visible ();
++  SI m= 16 * pixel;
++  return rectangle (vx1 - m, vy1 - m, vx2 + m, vy2 + m);
++}
++
+ void
+ edit_interface_rep::update_visible () {
+   SERVER (get_visible (vx1, vy1, vx2, vy2));
+@@ -1083,10 +1092,18 @@ edit_interface_rep::apply_changes () {
+ 
+ void
+ edit_interface_rep::animate () {
+-  if (((double) texmacs_time ()) >= anim_next) {
+-    rectangles rs= eb->anim_invalid ();
+-    invalidate (rs);
+-    stored_rects= rectangles ();
++  double now= (double) texmacs_time ();
++  if (now >= anim_next) {
++    rectangle vis= visible_part ();
++    rectangles rs= eb->anim_invalid (vis);
++    if (is_nil (rs))
++      // nothing to repaint (e.g. the animations left the screen), so that
++      // draw_text will not update anim_next: do it here
++      anim_next= max (now + 25.0, eb->anim_next (vis));
++    else {
++      invalidate (rs);
++      stored_rects= rectangles ();
++    }
+   }
+ }
+ 
+diff --git a/src/Edit/Interface/edit_interface.hpp b/src/Edit/Interface/edit_interface.hpp
+index 1bd79d88a..8eb894cff 100644
+--- a/src/Edit/Interface/edit_interface.hpp
++++ b/src/Edit/Interface/edit_interface.hpp
+@@ -94,6 +94,7 @@ public:
+ 
+   /* routines for dealing with shrinked coordinates */
+   int  get_pixel_size ();
++  rectangle visible_part ();
+   SI   get_visible_width ();
+   SI   get_visible_height ();
+   SI   get_window_width ();
+diff --git a/src/Edit/Interface/edit_repaint.cpp b/src/Edit/Interface/edit_repaint.cpp
+index d931c0f76..d2d3a57af 100644
+--- a/src/Edit/Interface/edit_repaint.cpp
++++ b/src/Edit/Interface/edit_repaint.cpp
+@@ -50,7 +50,8 @@ edit_interface_rep::draw_text (renderer ren, rectangles& l) {
+   if (animated_flag) anim_next= 1.0e12;
+   eb->redraw (ren, eb->find_box_path (tp, tp_found), l);
+   if (animated_flag) {
+-    double t= max (((double) texmacs_time ()) + 25.0, eb->anim_next ());
++    double t= max (((double) texmacs_time ()) + 25.0,
++                   eb->anim_next (visible_part ()));
+     anim_next= min (anim_next, t);
+   }
+ }
+diff --git a/src/Typeset/Boxes/Animate/animate_boxes.cpp b/src/Typeset/Boxes/Animate/animate_boxes.cpp
+index bf9112462..7ad0de154 100644
+--- a/src/Typeset/Boxes/Animate/animate_boxes.cpp
++++ b/src/Typeset/Boxes/Animate/animate_boxes.cpp
+@@ -35,6 +35,12 @@ struct anim_box_rep: public box_rep {
+   void   anim_position (double pos) { delay= pos; }
+   double anim_time () { return pl->get_elapsed () - delay; }
+   void   pre_display (renderer& ren) { (void) ren; animated_flag= true; }
++  double anim_next () { return box_rep::anim_next (); }
++  rectangles anim_invalid () { return box_rep::anim_invalid (); }
++  double anim_next (rectangle vis) {
++    return anim_visible (vis)? anim_next (): 1.0e12; }
++  rectangles anim_invalid (rectangle vis) {
++    return anim_visible (vis)? anim_invalid (): rectangles (); }
+ };
+ 
+ struct composite_anim_box_rep: public composite_box_rep {
+@@ -51,6 +57,12 @@ struct composite_anim_box_rep: public composite_box_rep {
+   void   anim_position (double pos) { delay= pos; }
+   double anim_time () { return pl->get_elapsed () - delay; }
+   void   pre_display (renderer& ren) { (void) ren; animated_flag= true; }
++  double anim_next () { return box_rep::anim_next (); }
++  rectangles anim_invalid () { return box_rep::anim_invalid (); }
++  double anim_next (rectangle vis) {
++    return anim_visible (vis)? anim_next (): 1.0e12; }
++  rectangles anim_invalid (rectangle vis) {
++    return anim_visible (vis)? anim_invalid (): rectangles (); }
+ };
+ 
+ /******************************************************************************
+diff --git a/src/Typeset/Boxes/Basic/boxes.cpp b/src/Typeset/Boxes/Basic/boxes.cpp
+index 54c46bff6..1404e853a 100644
+--- a/src/Typeset/Boxes/Basic/boxes.cpp
++++ b/src/Typeset/Boxes/Basic/boxes.cpp
+@@ -805,6 +805,43 @@ box_rep::anim_invalid () {
+   return rs;
+ }
+ 
++/* The same, restricted to the animations which intersect the rectangle vis
++   (the visible part of the document).  Walking the whole box tree at each
++   frame of an animation made a long document with a single animated image
++   slow to edit, also when the animation was far away from the screen.
++   Animations which are not visited resynchronize when they are displayed. */
++
++bool
++box_rep::anim_visible (rectangle vis) {
++  return min (x1, x3) < vis->x2 && max (x2, x4) > vis->x1 &&
++         min (y1, y3) < vis->y2 && max (y2, y4) > vis->y1;
++}
++
++double
++box_rep::anim_next (rectangle vis) {
++  double r= 1.0e12;
++  if (!anim_visible (vis)) return r;
++  int i, n= subnr ();
++  for (i=0; i<n; i++) {
++    double sr= subbox (i)->anim_next (translate (vis, -sx (i), -sy (i)));
++    r= min (r, sr);
++  }
++  return r;
++}
++
++rectangles
++box_rep::anim_invalid (rectangle vis) {
++  rectangles rs;
++  if (!anim_visible (vis)) return rs;
++  int i, n= subnr ();
++  for (i=0; i<n; i++) {
++    rectangles rs2= subbox (i)->anim_invalid (translate (vis, -sx (i), -sy (i)));
++    rs2= translate (rs2, sx (i), sy (i));
++    rs << rs2;
++  }
++  return rs;
++}
++
+ /******************************************************************************
+ * Miscellaneous routines
+ ******************************************************************************/
+diff --git a/src/Typeset/Boxes/Modifier/change_boxes.cpp b/src/Typeset/Boxes/Modifier/change_boxes.cpp
+index 5cca20996..895290df0 100644
+--- a/src/Typeset/Boxes/Modifier/change_boxes.cpp
++++ b/src/Typeset/Boxes/Modifier/change_boxes.cpp
+@@ -302,6 +302,11 @@ public:
+   operator tree () { return tree (TUPLE, "transform", (tree) bs[0]); }
+   void pre_display (renderer &ren);
+   void post_display (renderer &ren);
++  // the child is transformed: no culling of its animations by position
++  double anim_next (rectangle vis) {
++    return anim_visible (vis)? box_rep::anim_next (): 1.0e12; }
++  rectangles anim_invalid (rectangle vis) {
++    return anim_visible (vis)? box_rep::anim_invalid (): rectangles (); }
+   //cursor find_cursor (path bp);
+   //selection find_selection (path lbp, path rbp);
+   void get_bracket_extents (SI& lo, SI& hi) { lo= y1; hi= y2; }
+@@ -344,6 +349,12 @@ public:
+   box adjust_kerning (int mode, double factor);
+   box expand_glyphs (int mode, double factor);
+   void redraw (renderer ren, path p, rectangles& l);
++  // effects may draw outside the extents of the children: no culling of
++  // their animations by position
++  double anim_next (rectangle vis) {
++    return anim_visible (vis)? box_rep::anim_next (): 1.0e12; }
++  rectangles anim_invalid (rectangle vis) {
++    return anim_visible (vis)? box_rep::anim_invalid (): rectangles (); }
+   void get_bracket_extents (SI& lo, SI& hi) { lo= y1; hi= y2; }
+ };
+ 
+diff --git a/src/Typeset/boxes.hpp b/src/Typeset/boxes.hpp
+index 6c80c08a7..8e04f0afb 100644
+--- a/src/Typeset/boxes.hpp
++++ b/src/Typeset/boxes.hpp
+@@ -257,6 +257,9 @@ public:
+   virtual void       anim_position (double delay);
+   virtual double     anim_next ();
+   virtual rectangles anim_invalid ();
++  virtual double     anim_next (rectangle vis);
++  bool               anim_visible (rectangle vis);
++  virtual rectangles anim_invalid (rectangle vis);
+ 
+   /********************************* obsolete ********************************/
+ 
+-- 
+2.53.0
+

@@ -9,6 +9,20 @@ Evidence and material for a patch series that makes typing in long TeXmacs docum
 * The patches: [patches/](patches/) (against the `development` branch; they also apply to
   current trunk)
 
+
+## Follow-up (2026-09-30)
+
+Five more commits on PR #112: a bug fix for the series, cheaper paragraph removal, animations
+advanced only while visible, and moving the pixels of unchanged lines instead of redrawing
+them (Return and Backspace: 700–1,450 ms → 80–100 ms per key). Details and tests:
+[FOLLOWUP.md](FOLLOWUP.md); patches in [patches/followup/](patches/followup/) (for
+`development` and for trunk r15747); pixel oracle `bench/shift-check.py` and `bench/shift-suite.sh`.
+
+Separate pull requests found along the way:
+[#114](https://github.com/texmacs/texmacs/pull/114) (GIF images missing from PDF exports),
+[#115](https://github.com/texmacs/texmacs/pull/115) (tiny Qt 5 interface on HiDPI screens with a theme),
+[#116](https://github.com/texmacs/texmacs/pull/116) (animated gifs in `<video>` embedded as videos in PDF exports).
+
 ## Before / after
 
 Each video shows the unpatched build on the left and the patched build on the right. The

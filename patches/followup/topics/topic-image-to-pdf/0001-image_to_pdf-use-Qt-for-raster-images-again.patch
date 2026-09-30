@@ -1,0 +1,38 @@
+From 49df4b0f306bd036292bf29cc2e04f2c1bdedbcf Mon Sep 17 00:00:00 2001
+From: Gli_acopo <82150202+GliAcopo@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 17:16:22 +0200
+Subject: [PATCH] image_to_pdf: use Qt for raster images again
+
+Since r14602 (bug #66706), image_to_pdf only uses Qt if
+qt_supports (pdf), which is always false (qt_supports excludes pdf, ps
+and eps), so raster images that Qt reads (GIF, BMP, WebP, ...) go to the
+Scheme converters.  These convert the image to EPS first.  Qt5 cannot
+write EPS, and ImageMagick often may not (security policy of Debian,
+Ubuntu, ...): the conversion fails, but the converter still reports
+success and returns an empty A4 page, so the image silently disappears
+from the exported PDF.
+
+The fix of r14602 is needed in image_to_eps, where Qt5 indeed cannot write
+PostScript, but qt_image_to_pdf writes PDF files with QPrinter: drop the
+condition in image_to_pdf only, as in TeXmacs 2.1.4.
+---
+ src/System/Files/image_files.cpp | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/src/System/Files/image_files.cpp b/src/System/Files/image_files.cpp
+index 236d4ead4..fe29a1d76 100644
+--- a/src/System/Files/image_files.cpp
++++ b/src/System/Files/image_files.cpp
+@@ -504,7 +504,8 @@ image_to_pdf (url image, url pdf, int w_pt, int h_pt, int dpi) {
+ #endif
+   //converters below will yield only raster images.
+ #ifdef QTTEXMACS
+-  if (qt_supports (image) && qt_supports (pdf)) {
++  // not qt_supports (pdf), which is always false: Qt writes PDF files
++  if (qt_supports (image)) {
+     if (DEBUG_CONVERT) debug_convert << " using qt "<<LF;
+     qt_image_to_pdf (image, pdf, w_pt, h_pt, dpi);
+     return;
+-- 
+2.53.0
+

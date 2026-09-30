@@ -1,0 +1,834 @@
+From 924fff599dbeb5599d45bafc96dde182a9c5553a Mon Sep 17 00:00:00 2001
+From: Gli_acopo <82150202+GliAcopo@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 17:14:36 +0200
+Subject: [PATCH 5/5] move the pixels of unchanged lines instead of redrawing
+ them
+
+Outside paper mode, pressing Return or joining two lines moves every line
+below the change, and the whole window below it was redrawn glyph by
+glyph: 450 ms of CPU per key at 2560x1600 on long lecture notes (1.4 s on
+a document with many figures).
+
+Layout.  The distance between the origins of successive items of the body
+is rounded to a multiple of the renderer's pixel (snap_stack_spacing, in
+the merge of the document bridge and in the papyrus pager), so that all
+items below a change move by a whole number of pixels.  Each distance is
+off by less than half a pixel; paper mode and printing do not use it.
+
+Detection (typesetter_rep::find_shift).  The typesetter keeps the items of
+the body of the previous pass until the new body is built, so that
+identity comparisons are meaningful, and releases them before
+position_at collects the areas to repaint.  When the last items are the
+same boxes, all moved by the same multiple of the pixel, it reports the
+band that they covered, provided that nothing else was or will be drawn
+in it: no other item of the body reaches into it (extents with ink), no
+other part of the page (headers, footers, floats, notes, found on the path
+from the root to the body) overlaps it, and page backgrounds are not
+patterns.  requires_update then drops the pairs of phrase boxes inside the
+band which moved by exactly that amount, and adds the moved images of the
+other areas of the band.
+
+Screen.  The editor asks the widget to move the pixels of the band
+(SLOT_SHIFT_CONTENTS; QPixmap::scroll on the backing store in the Qt
+plugin, where pending invalid regions inside the band are moved along and
+the uncovered parts are invalidated).  It then invalidates the edges of
+the band and the overlays drawn over moved text (cursor, selections,
+search and spell highlights, environment boxes, loci, shown keys) at their
+old and new places, and only the visible part of the remaining areas: in
+a document with notes at the end, their union would otherwise reach the
+end of the document.
+
+Conditions.  Only with the Qt GUI, outside paper mode, for the first
+typesetting pass of a change, with a plain document background, outside
+graphics, and when the preference "move unchanged lines" is on (the
+default).  With the preference off, neither the rounding nor the moves
+take place and the layout is the one of trunk.  Other GUIs never receive
+the new message.
+---
+ src/Edit/Editor/edit_typeset.cpp       |  23 ++++
+ src/Edit/Interface/edit_interface.cpp  |  73 +++++++++++++
+ src/Edit/Interface/edit_interface.hpp  |   3 +
+ src/Edit/Interface/edit_repaint.cpp    |   1 +
+ src/Edit/editor.hpp                    |   2 +
+ src/Graphics/Gui/message.hpp           |   9 ++
+ src/Graphics/Gui/widget.cpp            |   1 +
+ src/Plugins/Qt/qt_simple_widget.cpp    |  77 ++++++++++++-
+ src/Plugins/Qt/qt_simple_widget.hpp    |   2 +
+ src/Typeset/Bridge/bridge.cpp          |  14 ++-
+ src/Typeset/Bridge/bridge.hpp          |   1 +
+ src/Typeset/Bridge/impl_typesetter.hpp |  13 +++
+ src/Typeset/Bridge/typesetter.cpp      | 144 +++++++++++++++++++++++--
+ src/Typeset/Page/make_pages.cpp        |   7 ++
+ src/Typeset/Page/pager.cpp             |  20 +++-
+ src/Typeset/Page/pager.hpp             |   3 +
+ src/Typeset/Stack/stacker.cpp          |  16 +++
+ src/Typeset/Stack/stacker.hpp          |   1 +
+ 18 files changed, 396 insertions(+), 14 deletions(-)
+
+diff --git a/src/Edit/Editor/edit_typeset.cpp b/src/Edit/Editor/edit_typeset.cpp
+index 7f32416a1..197049aa4 100644
+--- a/src/Edit/Editor/edit_typeset.cpp
++++ b/src/Edit/Editor/edit_typeset.cpp
+@@ -1081,9 +1081,32 @@ edit_typeset_rep::typeset (SI& x1, SI& y1, SI& x2, SI& y2) {
+   int missing_nr= INT_MAX;
+   int redefined_nr= INT_MAX;
+   x1= MAX_SI; y1= MAX_SI; x2= MIN_SI; y2= MIN_SI;
++  bool allowed;
++  SI snap= shift_pixel (allowed);
+   while (true) {
+     SI sx1, sy1, sx2, sy2;
++    ttt->snap_pixel= snap;
++    ttt->shift_allowed= allowed;
+     typeset_sub (sx1, sy1, sx2, sy2);
++    if (ttt->shift_dy != 0) {
++      // the areas to repaint are then usually the changed lines and a few
++      // far away things (e.g. notes at the end), whose union would cover
++      // everything in between: only repaint what is on the screen
++      rectangle vis= shift_contents (ttt->shift_y1, ttt->shift_y2,
++                                     ttt->shift_dy);
++      sx1= MAX_SI; sy1= MAX_SI; sx2= MIN_SI; sy2= MIN_SI;
++      for (rectangles l= ttt->shift_rects; !is_nil (l); l= l->next) {
++        rectangle r= l->item;
++        SI rx1= max (r->x1, vis->x1), ry1= max (r->y1, vis->y1);
++        SI rx2= min (r->x2, vis->x2), ry2= min (r->y2, vis->y2);
++        if (rx1 >= rx2 || ry1 >= ry2) continue;
++        sx1= min (sx1, rx1); sy1= min (sy1, ry1);
++        sx2= max (sx2, rx2); sy2= max (sy2, ry2);
++      }
++      if (sx1 > sx2) sx1= sy1= sx2= sy2= 0;
++      ttt->shift_rects= rectangles ();
++    }
++    allowed= false;  // only the first pass starts from what is on the screen
+     x1= min (x1, sx1); y1= min (y1, sy1);
+     x2= max (x2, sx2); y2= max (y2, sy2);
+     if (!env->complete) break;
+diff --git a/src/Edit/Interface/edit_interface.cpp b/src/Edit/Interface/edit_interface.cpp
+index 5a5aead14..07ada681e 100644
+--- a/src/Edit/Interface/edit_interface.cpp
++++ b/src/Edit/Interface/edit_interface.cpp
+@@ -66,6 +66,7 @@ edit_interface_rep::edit_interface_rep ():
+   magf (zoomf / std_shrinkf),
+   pixel ((SI) tm_round ((std_shrinkf * PIXEL) / zoomf)),
+   zpixel (max ((SI) tm_round (std_shrinkf * PIXEL), pixel)),
++  draw_pixel (0),
+   copy_always (),
+   last_x (0), last_y (0), last_t (0),
+   tremble_count (0), tremble_right (false),
+@@ -206,6 +207,78 @@ edit_interface_rep::visible_part () {
+   return rectangle (vx1 - m, vy1 - m, vx2 + m, vy2 + m);
+ }
+ 
++/******************************************************************************
++* Moving the pixels of unchanged lines
++******************************************************************************/
++
++SI
++edit_interface_rep::shift_pixel (bool& allowed) {
++  // Outside paper mode, the typesetter rounds the distances between the
++  // lines of the body to the screen pixel returned here, and it may ask
++  // to move the pixels of unchanged lines (allowed) when the page has a
++  // plain background and nothing else is drawn over the text.  With the
++  // preference off, 0 is returned: the layout is not rounded either.
++  // Before the first repaint, the pixel of the renderer is not known yet:
++  // use the pixel of the editor, which is the same unless the renderer
++  // works with a device pixel ratio.
++  allowed= false;
++#ifdef QTTEXMACS
++  if (get_init_string (PAGE_MEDIUM) == "paper" ||
++      get_user_preference ("move unchanged lines", "on") != "on") return 0;
++  if (draw_pixel <= 0) return pixel;
++  allowed= is_atomic (get_init_value (BG_COLOR)) &&
++           !inside_graphics (false) && is_nil (stored_rects) &&
++           is_attached (this);
++  return draw_pixel;
++#else
++  return 0;
++#endif
++}
++
++static void
++invalidate_moved (edit_interface_rep* ed, rectangles rs, SI dy) {
++  // an overlay was drawn at rs: its pixels were moved along
++  if (is_nil (rs)) return;
++  ed->invalidate (rs);
++  ed->invalidate (translate (rs, 0, dy));
++}
++
++rectangle
++edit_interface_rep::shift_contents (SI y1, SI y2, SI dy) {
++  // Move the pixels between the ordinates y1 and y2 by dy (upwards), a
++  // multiple of draw_pixel (see typesetter_rep::find_shift), over the whole
++  // width of the window.  The widget invalidates the uncovered parts.
++  // Returns the visible part of the document (with a margin).
++  update_visible ();
++  SI x1= min (vx1, eb->x1) - 16 * pixel, x2= max (vx2, eb->x2) + 16 * pixel;
++  SI k = dy / draw_pixel;
++  send_shift_contents (this, (SI) floor (x1*magf), (SI) floor (y1*magf),
++                       (SI) ceil (x2*magf), (SI) ceil (y2*magf), -k);
++  // pixel rows at the edges of the band may also contain other things
++  SI p= 3 * pixel;
++  invalidate (x1, y1 + dy - p, x2, y1 + dy + p);
++  invalidate (x1, y2 + dy - p, x2, y2 + dy + p);
++  // things drawn over the text
++  SI dw= 0;
++  if (tremble_count > 3) dw= (1 + min (tremble_count - 3, 25)) * 2 * pixel;
++  SI P3= 3 * zpixel;
++  rectangle ocr (oc->ox+ ((SI) ((oc->y1-dw)*oc->slope))- P3 - dw,
++                 oc->oy+ (oc->y1-dw)- P3,
++                 oc->ox+ ((SI) ((oc->y2+dw)*oc->slope))+ P3 + dw,
++                 oc->oy+ (oc->y2+dw)+ P3);
++  invalidate_moved (this, rectangles (ocr), dy);
++  invalidate_moved (this, copy_always, dy);
++  invalidate_moved (this, selection_rects, dy);
++  for (int i=0; i<N(alt_selection_rects); i++)
++    invalidate_moved (this, alt_selection_rects[i], dy);
++  invalidate_moved (this, env_rects, dy);
++  invalidate_moved (this, foc_rects, dy);
++  invalidate_moved (this, sem_rects, dy);
++  invalidate_moved (this, locus_rects, dy);
++  invalidate_moved (this, keys_rects, dy);
++  return visible_part ();
++}
++
+ void
+ edit_interface_rep::update_visible () {
+   SERVER (get_visible (vx1, vy1, vx2, vy2));
+diff --git a/src/Edit/Interface/edit_interface.hpp b/src/Edit/Interface/edit_interface.hpp
+index 8eb894cff..842a9ab24 100644
+--- a/src/Edit/Interface/edit_interface.hpp
++++ b/src/Edit/Interface/edit_interface.hpp
+@@ -46,6 +46,7 @@ protected:
+   double        magf;          // the current magnification factor
+   SI            pixel;         // current size of a pixel on the screen
+   SI            zpixel;        // pixel multiplied by zoom factor
++  SI            draw_pixel;    // pixel of the renderer at the last repaint
+   rectangles    copy_always;   // for wiping out cursor
+   int           input_mode;    // INPUT_NORMAL, INPUT_SEARCH, INPUT_REPLACE
+ 
+@@ -111,6 +112,8 @@ public:
+   void invalidate (SI x1, SI y1, SI x2, SI y2);
+   void invalidate (rectangles rs);
+   void invalidate_all ();
++  SI   shift_pixel (bool& allowed);
++  rectangle shift_contents (SI y1, SI y2, SI dy);
+   void update_visible ();
+   void scroll_to (SI x, SI y);
+   void set_extents (SI x1, SI y1, SI x2, SI y2);
+diff --git a/src/Edit/Interface/edit_repaint.cpp b/src/Edit/Interface/edit_repaint.cpp
+index d2d3a57af..d5ce2d3c8 100644
+--- a/src/Edit/Interface/edit_repaint.cpp
++++ b/src/Edit/Interface/edit_repaint.cpp
+@@ -294,6 +294,7 @@ edit_interface_rep::draw_with_shadow (renderer win, rectangle r) {
+   rectangles l;
+   win->set_zoom_factor (zoomf);
+   ren->set_zoom_factor (zoomf);
++  draw_pixel= win->pixel;
+   draw_pre (win, ren, r);
+   draw_text (ren, l);
+   ren->reset_zoom_factor ();
+diff --git a/src/Edit/editor.hpp b/src/Edit/editor.hpp
+index c10d42d32..aaa2d817c 100644
+--- a/src/Edit/editor.hpp
++++ b/src/Edit/editor.hpp
+@@ -168,6 +168,8 @@ public:
+   virtual void invalidate (SI x1, SI y1, SI x2, SI y2) = 0;
+   virtual void invalidate (rectangles rs) = 0;
+   virtual void invalidate_all () = 0;
++  virtual SI   shift_pixel (bool& allowed) = 0;
++  virtual rectangle shift_contents (SI y1, SI y2, SI dy) = 0;
+   virtual void scroll_to (SI x, SI y) = 0;
+   virtual void notify_change (int env_set, int env_unset = 0) = 0;
+   virtual bool has_changed (int question) = 0;
+diff --git a/src/Graphics/Gui/message.hpp b/src/Graphics/Gui/message.hpp
+index 7d5dc9fe6..8a3e9f94e 100644
+--- a/src/Graphics/Gui/message.hpp
++++ b/src/Graphics/Gui/message.hpp
+@@ -40,6 +40,7 @@ enum slot_id {
+   SLOT_MOUSE_POINTER,
+   SLOT_INVALIDATE,
+   SLOT_INVALIDATE_ALL,
++  SLOT_SHIFT_CONTENTS,
+   SLOT_INVALID,
+   SLOT_REPAINT,
+   SLOT_DELAYED_MESSAGE,
+@@ -410,6 +411,14 @@ send_invalidate (widget w, SI x1, SI y1, SI x2, SI y2) {
+   send<SI,SI,SI,SI> (w, SLOT_INVALIDATE, x1, y1, x2, y2);
+ }
+ 
++inline void
++send_shift_contents (widget w, SI x1, SI y1, SI x2, SI y2, SI dy) {
++  // move the pixels already painted in a region (specified as for
++  // send_invalidate) by dy device pixels downwards; the parts which
++  // cannot be filled from the moved pixels become invalid
++  send<SI,SI,SI,SI,SI> (w, SLOT_SHIFT_CONTENTS, x1, y1, x2, y2, dy);
++}
++
+ inline bool
+ query_invalid (widget w) {
+   // does this widget has invalid regions
+diff --git a/src/Graphics/Gui/widget.cpp b/src/Graphics/Gui/widget.cpp
+index 3e714593c..95a4a0ff2 100644
+--- a/src/Graphics/Gui/widget.cpp
++++ b/src/Graphics/Gui/widget.cpp
+@@ -39,6 +39,7 @@ slot_name (const slot s) {
+     "SLOT_MOUSE_POINTER",
+     "SLOT_INVALIDATE",
+     "SLOT_INVALIDATE_ALL",
++    "SLOT_SHIFT_CONTENTS",
+     "SLOT_INVALID",
+     "SLOT_REPAINT",
+     "SLOT_DELAYED_MESSAGE",
+diff --git a/src/Plugins/Qt/qt_simple_widget.cpp b/src/Plugins/Qt/qt_simple_widget.cpp
+index cbf5d027a..3934c6050 100644
+--- a/src/Plugins/Qt/qt_simple_widget.cpp
++++ b/src/Plugins/Qt/qt_simple_widget.cpp
+@@ -173,7 +173,7 @@ qt_simple_widget_rep::reapply_sent_slots () {
+ 
+ void
+ qt_simple_widget_rep::send (slot s, blackbox val) {
+-  save_send_slot (s, val);
++  if (s != SLOT_SHIFT_CONTENTS) save_send_slot (s, val);
+ 
+   switch (s) {
+     case SLOT_INVALIDATE:
+@@ -199,6 +199,24 @@ qt_simple_widget_rep::send (slot s, blackbox val) {
+       invalidate_all ();
+     }
+       break;
++
++    case SLOT_SHIFT_CONTENTS:
++    {
++      typedef quintuple<SI,SI,SI,SI,SI> coord5;
++      check_type<coord5>(val, s);
++      coord5 p= open_box<coord5> (val);
++      qt_renderer_rep* ren = the_qt_renderer (device_pixel_ratio ());
++      coord2 pt_or = from_qpoint(backing_pos);
++      SI ox = -pt_or.x1;
++      SI oy = -pt_or.x2;
++      ren->set_origin(ox,oy);
++      SI x1 = p.x1, y1 = p.x2, x2 = p.x3, y2 = p.x4;
++      ren->outer_round (x1, y1, x2, y2);
++      ren->decode (x1, y1);
++      ren->decode (x2, y2);
++      shift_rect (x1, y2, x2, y1, p.x5);
++    }
++      break;
+       
+     case SLOT_EXTENTS:
+     {
+@@ -472,6 +490,59 @@ qt_simple_widget_rep::invalidate_all () {
+ #endif
+ }
+ 
++/*
++ Move the pixels of the rectangle (in backing store coordinates) by dy,
++ downwards if dy > 0, as the editor does when unchanged lines of a document
++ move.  The parts of the destination which cannot be filled with valid moved
++ pixels are invalidated, and so are the images of pending invalid regions.
++ The screen is updated at the next repaint_invalid_regions.
++ */
++void
++qt_simple_widget_rep::shift_rect (int x1, int y1, int x2, int y2, int dy) {
++  if (x1 >= x2 || y1 >= y2) return;
++  QRect src (x1, y1, x2 - x1, y2 - y1);
++  QRect all= src.united (src.translated (0, dy));
++  if (backingPixmap == NULL || backingPixmap->isNull () || !backing_valid ||
++      dy == 0 || !canvas ()) {
++    invalidate_rect (all.left (), all.top (),
++                     all.right () + 1, all.bottom () + 1);
++    return;
++  }
++  all= all & backingPixmap->rect ();
++  if (all.isEmpty ()) return;
++  QRegion exposed;
++  backingPixmap->scroll (0, dy, all, &exposed);
++#if QT_VERSION >= 0x050800
++  for (const QRect& r: exposed)
++    invalidate_rect (r.left (), r.top (), r.right () + 1, r.bottom () + 1);
++#else
++  QVector<QRect> exposed_rects= exposed.rects ();
++  for (int i=0; i<exposed_rects.size (); i++) {
++    const QRect& r= exposed_rects[i];
++    invalidate_rect (r.left (), r.top (), r.right () + 1, r.bottom () + 1);
++  }
++#endif
++  rectangles moved;
++  for (rectangles l= invalid_regions; !is_nil (l); l= l->next) {
++    rectangle r= l->item;
++    SI ix1= max (r->x1, x1), iy1= max (r->y1, y1);
++    SI ix2= min (r->x2, x2), iy2= min (r->y2, y2);
++    if (ix1 < ix2 && iy1 < iy2)
++      moved= rectangles (rectangle (ix1, iy1 + dy, ix2, iy2 + dy), moved);
++  }
++  if (!is_nil (moved)) invalid_regions= invalid_regions | moved;
++#if QT_VERSION >= 0x060000
++  double pixel_ratio= canvas()->surface()->devicePixelRatio();
++#else
++  double pixel_ratio= retina_factor;
++#endif
++  int lx1= (int) floor (all.left () / pixel_ratio);
++  int ly1= (int) floor (all.top () / pixel_ratio);
++  int lx2= (int) ceil ((all.right () + 1) / pixel_ratio);
++  int ly2= (int) ceil ((all.bottom () + 1) / pixel_ratio);
++  shifted_region += QRect (lx1, ly1, lx2 - lx1, ly2 - ly1);
++}
++
+ bool
+ qt_simple_widget_rep::is_invalid () {
+   return !is_nil (invalid_regions);
+@@ -674,6 +745,10 @@ qt_simple_widget_rep::repaint_invalid_regions () {
+   }
+   
+   // propagate immediately the changes to the screen
++  if (!shifted_region.isEmpty ()) {
++    qrgn += shifted_region;
++    shifted_region= QRegion ();
++  }
+   if (!qrgn.isEmpty ()) {
+     canvas()->surface()->repaint (qrgn);
+     backing_valid= true;
+diff --git a/src/Plugins/Qt/qt_simple_widget.hpp b/src/Plugins/Qt/qt_simple_widget.hpp
+index 4a5aff664..4307a326c 100644
+--- a/src/Plugins/Qt/qt_simple_widget.hpp
++++ b/src/Plugins/Qt/qt_simple_widget.hpp
+@@ -105,8 +105,10 @@ protected:
+   QPixmap*     backingPixmap;  
+   QPoint       backing_pos;
+   bool         backing_valid;
++  QRegion      shifted_region;  // moved in the backing store, not on screen
+ 
+   void invalidate_rect (int x1, int y1, int x2, int y2);
++  void shift_rect (int x1, int y1, int x2, int y2, int dy);
+   void invalidate_all ();
+   bool is_invalid ();
+   void repaint_invalid_regions ();
+diff --git a/src/Typeset/Bridge/bridge.cpp b/src/Typeset/Bridge/bridge.cpp
+index 1919fb96d..52f66c43e 100644
+--- a/src/Typeset/Bridge/bridge.cpp
++++ b/src/Typeset/Bridge/bridge.cpp
+@@ -11,6 +11,7 @@
+ 
+ #include "bridge.hpp"
+ #include "Boxes/construct.hpp"
++#include "Stack/stacker.hpp"
+ 
+ bridge bridge_document (typesetter, tree, path);
+ bridge bridge_surround (typesetter, tree, path);
+@@ -39,7 +40,7 @@ bridge nil_bridge;
+ bridge_rep::bridge_rep (typesetter ttt2, tree st2, path ip2):
+   ttt (ttt2), env (ttt->env), st (st2), ip (ip2),
+   status (CORRUPTED), changes (UNINIT), removed (UNINIT),
+-  stack_cache_ok (false), version (0),
++  stack_cache_ok (false), stack_cache_snap (0), version (0),
+   chunk_cache (NULL) {}
+ 
+ static tree inactive_auto
+@@ -467,9 +468,13 @@ bridge_rep::typeset (int desired_status) {
+ 
+   // ttt->insert_stack (l, sb);
+   //if (N(l) == 0); else
++  bool root= (this == ttt->br.operator-> ());
+   if (ttt->paper || (N(l) <= 1)) ttt->insert_stack (l, sb);
+-  else if (stack_cache_ok && strong_equal (ip, stack_cache_ip))
++  else if (stack_cache_ok && strong_equal (ip, stack_cache_ip) &&
++           (!root || stack_cache_snap == ttt->snap_pixel)) {
++    if (root && N(stack_cache) > 0) ttt->last_body= stack_cache[0]->b;
+     ttt->insert_stack (stack_cache, sb);
++  }
+   else {
+     bool flag= false;
+     int i, n= N(l);
+@@ -478,6 +483,7 @@ bridge_rep::typeset (int desired_status) {
+     if (flag) {
+       stack_cache= chunk_lines (this, l);
+       stack_cache_ip= ip;
++      stack_cache_snap= ttt->snap_pixel;
+       stack_cache_ok= true;
+       ttt->insert_stack (stack_cache, sb);
+     }
+@@ -498,14 +504,18 @@ bridge_rep::typeset (int desired_status) {
+                   l[i]->t[1] == PAGE_THIS_BOT ||
+                   l[i]->t[1] == PAGE_THIS_BG_COLOR))
+           special_l << l[i];
++      if (root && ttt->snap_pixel > 0)
++        snap_stack_spacing (bs, spc, ttt->snap_pixel);
+       box lb= stack_box (path (ip), bs, spc);
+       if (first != -1) lb= move_box (path (ip), lb, 0, bs[first]->y2);
++      if (root) ttt->last_body= lb;
+       array<page_item> new_l (1);
+       new_l[0]= page_item (lb);
+       new_l[0]->spc= l[last]->spc;
+       new_l << special_l;
+       stack_cache= new_l;
+       stack_cache_ip= ip;
++      stack_cache_snap= ttt->snap_pixel;
+       stack_cache_ok= true;
+       ttt->insert_stack (new_l, sb);
+     }
+diff --git a/src/Typeset/Bridge/bridge.hpp b/src/Typeset/Bridge/bridge.hpp
+index 18ef6b9d3..1432dd93e 100644
+--- a/src/Typeset/Bridge/bridge.hpp
++++ b/src/Typeset/Bridge/bridge.hpp
+@@ -53,6 +53,7 @@ public:
+   array<page_item>     stack_cache;
+   path                 stack_cache_ip;
+   bool                 stack_cache_ok;
++  SI                   stack_cache_snap; // snap_pixel of the typesetter
+   int                  version;  // incremented whenever l is recomputed
+   chunk_cache_rep*     chunk_cache; // see chunk_lines in bridge.cpp
+ 
+diff --git a/src/Typeset/Bridge/impl_typesetter.hpp b/src/Typeset/Bridge/impl_typesetter.hpp
+index ac864a49d..671446567 100644
+--- a/src/Typeset/Bridge/impl_typesetter.hpp
++++ b/src/Typeset/Bridge/impl_typesetter.hpp
+@@ -29,6 +29,18 @@ public:
+   hashmap<string,tree> old_patch;
+   bool paper;
+ 
++  // Moving the pixels of unchanged lines outside paper mode (set by the
++  // editor before typesetting; see find_shift)
++  SI   snap_pixel;          // screen pixel to which line distances are rounded
++  bool shift_allowed;       // may the editor move pixels on the screen?
++  array<box> body_lines;    // lines of the body at the last pass
++  array<SI>  body_ys;       // and the absolute ordinates of their origins
++  array<rectangle> body_others; // vertical extents of the rest of the page
++  SI   shift_y1, shift_y2;  // after typesetting: band of unchanged lines
++  SI   shift_dy;            // moved by shift_dy (0: nothing to move)
++  rectangles shift_rects;   // then the areas to repaint (not their union)
++  box  last_body;           // body stack made by the pager at this pass
++
+ public:
+   typesetter_rep (edit_env& env, tree et, path ip);
+ 
+@@ -42,6 +54,7 @@ public:
+   void local_end     (array<page_item>& l, stack_border& sb);
+ 
+   void determine_page_references (box b);
++  void find_shift (box b, box body, bool plain);
+   box  typeset ();
+   box  typeset (SI& x1, SI& y1, SI& x2, SI& y2);
+ };
+diff --git a/src/Typeset/Bridge/typesetter.cpp b/src/Typeset/Bridge/typesetter.cpp
+index 6219b1b92..52ab70475 100644
+--- a/src/Typeset/Bridge/typesetter.cpp
++++ b/src/Typeset/Bridge/typesetter.cpp
+@@ -17,7 +17,9 @@
+ ******************************************************************************/
+ 
+ typesetter_rep::typesetter_rep (edit_env& env2, tree et, path ip):
+-  env (env2), old_patch (UNINIT)
++  env (env2), old_patch (UNINIT),
++  snap_pixel (0), shift_allowed (false), shift_y1 (0), shift_y2 (0),
++  shift_dy (0)
+ {
+   paper= (env->get_string (PAGE_MEDIUM) == "paper");
+   br= make_bridge (this, et, ip);
+@@ -106,19 +108,127 @@ typesetter_rep::local_end (array<page_item>& prev_l, stack_border& prev_sb) {
+ ******************************************************************************/
+ 
+ static rectangles
+-requires_update (rectangles log) {
++requires_update (rectangles log, SI y1, SI y2, SI dy) {
++  // Pairs (new, old) of phrase box areas, (0, old) for a destroyed box and
++  // (new, 0) for a new one.  If the editor moves the pixels between the
++  // ordinates y1 and y2 by dy (dy != 0), boxes inside that band which moved
++  // by exactly dy need no repainting, while whatever else was drawn in the
++  // band has been moved along and must be repainted at its new place.
++  rectangle zero (0, 0, 0, 0);
+   rectangles rs;
+   while (!is_nil (log)) {
+     rectangle r1= log->item;
+     rectangle r2= log->next->item;
+-    if (r1 == rectangle (0, 0, 0, 0)) rs= rectangles (r2, rs);
+-    else if (r2 == rectangle (0, 0, 0, 0)) rs= rectangles (r1, rs);
+-    else if (r1 != r2) rs= rectangles (r1, rectangles (r2, rs));
+     log= log->next->next;
++    if (dy != 0 && r2 != zero && r2->y2 > y1 && r2->y1 < y2) {
++      if (r1 == translate (r2, 0, dy) && r2->y1 >= y1 && r2->y2 <= y2)
++        continue;
++      rs= rectangles (translate (r2, 0, dy), rs);
++    }
++    if (r1 == zero) rs= rectangles (r2, rs);
++    else if (r2 == zero) rs= rectangles (r1, rs);
++    else if (r1 != r2) rs= rectangles (r1, rectangles (r2, rs));
+   }
+   return reverse (rs);
+ }
+ 
++static bool
++find_body (box b, box body, SI y, SI& by, array<rectangle>& others,
++           int depth) {
++  // Ordinate by of the origin of body inside b, looking only at a few levels
++  // of boxes with few children (the pages and their parts).  The vertical
++  // extents of the other children of the boxes on the path from b to body
++  // (headers, footers, floats, notes, ...) are added to others.
++  int i, n= b->subnr ();
++  if (depth > 12 || n > 16) return false;
++  for (i=0; i<n; i++) {
++    box c= b->subbox (i);
++    bool found= (c == body);
++    if (found) by= y + b->sy (i);
++    else found= find_body (c, body, y + b->sy (i), by, others, depth + 1);
++    if (found) {
++      for (int k=0; k<n; k++)
++        if (k != i) {
++          box o= b->subbox (k);
++          SI  oy= y + b->sy (k);
++          others << rectangle (0, oy + min (o->y1, o->y3),
++                               0, oy + max (o->y2, o->y4));
++        }
++      return true;
++    }
++  }
++  return false;
++}
++
++static bool
++clear_of (array<rectangle> others, SI y1, SI y2) {
++  for (int i=0; i<N(others); i++)
++    if (others[i]->y1 < y2 && others[i]->y2 > y1) return false;
++  return true;
++}
++
++void
++typesetter_rep::find_shift (box b, box body, bool plain) {
++  // Outside paper mode, the body of the document is one stack of lines
++  // (paragraphs are merged into a single line).  When the last lines are
++  // the same boxes as at the previous pass, all moved by the same multiple
++  // dy of the screen pixel (see snap_stack_spacing), the editor can move
++  // their pixels on the screen instead of redrawing them, provided that
++  // nothing else is drawn in the band that they cover, before and after:
++  // no other line of the body, no other part of the page, and only a plain
++  // page background (plain; the editor checks the one of the document).
++  array<box>       old_lines = body_lines;
++  array<SI>        old_ys    = body_ys;
++  array<rectangle> old_others= body_others;
++  body_lines = array<box> ();
++  body_ys    = array<SI> ();
++  body_others= array<rectangle> ();
++  SI oy;
++  array<rectangle> others;
++  if (is_nil (body) || !find_body (b, body, 0, oy, others, 0)) return;
++  while (body->get_type () == MOVE_BOX && body->subnr () == 1) {
++    oy += body->sy (0);
++    body= body->subbox (0);
++  }
++  if (body->get_type () != STACK_BOX) return;
++  int i, n= body->subnr ();
++  for (i=0; i<n; i++) {
++    body_lines << body->subbox (i);
++    body_ys    << oy + body->sy (i);
++  }
++  body_others= others;
++  if (!shift_allowed || !plain || snap_pixel <= 0) return;
++  int j, m= N(old_lines);
++  i= n-1; j= m-1;
++  SI dy= 0;
++  while (i >= 0 && j >= 0 && body_lines[i] == old_lines[j]) {
++    SI d= body_ys[i] - old_ys[j];
++    if (i < n-1 && d != dy) break;
++    dy= d; i--; j--;
++  }
++  // lines i+1..n-1 of the new body are lines j+1..m-1 of the old one
++  if (dy == 0 || i+1 >= n || (dy % snap_pixel) != 0) return;
++  SI y1= MAX_SI, y2= MIN_SI;
++  for (int k= j+1; k<m; k++) {
++    box l= old_lines[k];
++    y1= min (y1, old_ys[k] + min (l->y1, l->y3));
++    y2= max (y2, old_ys[k] + max (l->y2, l->y4));
++  }
++  // the other lines, old and new, must stay clear of the band
++  for (int k= 0; k<=j; k++) {
++    box l= old_lines[k];
++    if (old_ys[k] + min (l->y1, l->y3) < y2) return;
++  }
++  for (int k= 0; k<=i; k++) {
++    box l= body_lines[k];
++    if (body_ys[k] + min (l->y1, l->y3) < y2 + dy) return;
++  }
++  // and so must the other parts of the page
++  if (!clear_of (old_others, y1, y2)) return;
++  if (!clear_of (others, y1 + dy, y2 + dy)) return;
++  shift_y1= y1; shift_y2= y2; shift_dy= dy;
++}
++
+ void
+ typesetter_rep::determine_page_references (box b) {
+   hashmap<string,tree> h ("?");
+@@ -159,6 +269,7 @@ typesetter_rep::typeset () {
+ 
+   // Typeset
+   shove_cache_new_pass ();
++  last_body= box ();
+   if (env->complete) {
+     env->local_aux= hashmap<string,tree> (UNINIT);
+     env->missing  = hashmap<string,tree> (UNINIT);
+@@ -168,7 +279,9 @@ typesetter_rep::typeset () {
+   br->typeset (PROCESSED+ WANTED_PARAGRAPH);
+   shove_cache_end_pass ();
+   pager ppp= tm_new<pager_rep> (br->ip, env, l);
++  if (!paper) ppp->snap= snap_pixel;
+   box rb= ppp->make_pages ();
++  if (!is_nil (ppp->body)) last_body= ppp->body;
+   if (env->complete && paper) determine_page_references (rb);
+   tm_delete (ppp);
+   // env->complete= false;  // moved to edit_typeset_rep::typeset
+@@ -180,16 +293,27 @@ typesetter_rep::typeset (SI& x1b, SI& y1b, SI& x2b, SI& y2b) {
+   x1= x1b; y1= y1b; x2=x2b; y2= y2b;
+   box b= typeset ();
+   // cout << "-------------------------------------------------------------\n";
+-  b->position_at (0, 0, change_log);
+-  change_log= requires_update (change_log);
+-  rectangle r (0, 0, 0, 0);
+-  if (!is_nil (change_log)) r= least_upper_bound (change_log);
+   array<brush> new_bgs;
+   array<rectangle> rs;
+   b->collect_page_colors (new_bgs, rs);
++  bool plain= true;
++  for (int i=0; i<N(new_bgs); i++)
++    plain= plain && new_bgs[i]->get_type () != brush_pattern;
++  for (int i=0; i<N(old_bgs); i++)
++    plain= plain && old_bgs[i]->get_type () != brush_pattern;
++  shift_dy= 0;
++  find_shift (b, last_body, plain);  // before position_at: frees old lines
++  last_body= box ();
++  b->position_at (0, 0, change_log);
++  change_log= requires_update (change_log, shift_y1, shift_y2, shift_dy);
++  rectangle r (0, 0, 0, 0);
++  if (!is_nil (change_log)) r= least_upper_bound (change_log);
++  shift_rects= (shift_dy != 0? change_log: rectangles ());
+   for (int i=0; i<min(N(old_bgs), N(new_bgs)); i++)
+-    if (new_bgs[i] != old_bgs[i])
++    if (new_bgs[i] != old_bgs[i]) {
+       r= least_upper_bound (r, rs[i]);
++      if (shift_dy != 0) shift_rects= rectangles (rs[i], shift_rects);
++    }
+   old_bgs= new_bgs;
+   x1b= r->x1; y1b= r->y1; x2b= r->x2; y2b= r->y2;
+   change_log= rectangles ();
+diff --git a/src/Typeset/Page/make_pages.cpp b/src/Typeset/Page/make_pages.cpp
+index 5cbbec4da..0c0dda3bd 100644
+--- a/src/Typeset/Page/make_pages.cpp
++++ b/src/Typeset/Page/make_pages.cpp
+@@ -13,6 +13,8 @@
+ #include "Format/page_item.hpp"
+ #include "Format/stack_border.hpp"
+ #include "pager.hpp"
++box format_snapped_stack (path ip, array<box> bx, array<space> ht, SI height,
++                          SI snap);
+ box format_stack (path ip, array<box> bx, array<space> ht, SI height,
+ 		  bool may_stretch);
+ #include "Boxes/construct.hpp"
+@@ -54,6 +56,11 @@ pager_rep::pages_format (array<page_item> l, SI ht, SI tcor, SI bcor) {
+     box b= empty_box (decorate_middle (ip), 0, -ht, 0, 0);
+     return vcorrect_box (b->ip, b, tcor, bcor);
+   }
++  else if (snap > 0) {
++    box b= format_snapped_stack (ip, bs, spc, ht, snap);
++    if (N(bs) >= 2 && (is_nil (body) || N(bs) > body->subnr ())) body= b;
++    return vcorrect_box (b->ip, b, tcor, bcor);
++  }
+   else {
+     box b= format_stack (ip, bs, spc, ht, true);
+     return vcorrect_box (b->ip, b, tcor, bcor);
+diff --git a/src/Typeset/Page/pager.cpp b/src/Typeset/Page/pager.cpp
+index 37711ba77..399cb5c17 100644
+--- a/src/Typeset/Page/pager.cpp
++++ b/src/Typeset/Page/pager.cpp
+@@ -10,6 +10,7 @@
+ ******************************************************************************/
+ 
+ #include "pager.hpp"
++#include "Stack/stacker.hpp"
+ #include "Boxes/construct.hpp"
+ 
+ /******************************************************************************
+@@ -17,7 +18,7 @@
+ ******************************************************************************/
+ 
+ pager_rep::pager_rep (path ip2, edit_env env2, array<page_item> l2):
+-  ip (ip2), env (env2), style (UNINIT), l (l2)
++  ip (ip2), env (env2), style (UNINIT), l (l2), snap (0)
+ {
+   style (PAGE_THE_PAGE)     = tree (MACRO, compound ("page-nr"));
+   style (PAGE_ODD_HEADER)   = env->read (PAGE_ODD_HEADER);
+@@ -103,6 +104,23 @@ format_stack (path ip, array<box> bx, array<space> ht, SI height,
+   return stack_box (ip, bx, spc);
+ }
+ 
++box
++format_snapped_stack (path ip, array<box> bx, array<space> ht, SI height,
++                      SI snap) {
++  // as format_stack in the normal case, with the spacing rounded as in
++  // snap_stack_spacing (the lines of the body outside paper mode)
++  int i, n= N(bx);
++  space total (0);
++  for (i=0; i<n-1; i++) total += space (bx[i]->h()) + ht[i];
++  if (n > 0) total += space (bx[n-1]->h());
++  if (total->def != height) return format_stack (ip, bx, ht, height, true);
++  array<SI> spc (n);
++  for (i=0; i<n-1; i++) spc[i]= ht[i]->def;
++  if (n > 0) spc[n-1]= 0;
++  snap_stack_spacing (bx, spc, snap);
++  return stack_box (ip, bx, spc);
++}
++
+ box
+ format_stack (path ip, array<page_item> l) {
+   int i, n= N(l);
+diff --git a/src/Typeset/Page/pager.hpp b/src/Typeset/Page/pager.hpp
+index 078dfd272..762d7701d 100644
+--- a/src/Typeset/Page/pager.hpp
++++ b/src/Typeset/Page/pager.hpp
+@@ -52,6 +52,9 @@ public:
+   SI           cur_top;
+   array<box>   pages;
+ 
++  SI           snap;  // outside paper mode: screen pixel for the body lines
++  box          body;  // outside paper mode: the stack of the body lines
++
+   array<box>   lines_bx;
+   array<space> lines_ht;
+ 
+diff --git a/src/Typeset/Stack/stacker.cpp b/src/Typeset/Stack/stacker.cpp
+index 4ae20494c..627db149d 100644
+--- a/src/Typeset/Stack/stacker.cpp
++++ b/src/Typeset/Stack/stacker.cpp
+@@ -240,6 +240,22 @@ struct shove_entry {
+ // entries of the current and of the previous pass, by their second box
+ static hashmap<pointer,shove_entry> shove_cur, shove_prev;
+ 
++void
++snap_stack_spacing (array<box> bs, array<SI>& spc, SI snap) {
++  // Outside paper mode, the distance between the origins of successive
++  // lines of the document is rounded to a multiple of the screen pixel
++  // snap, so that all lines below a change move by a whole number of
++  // pixels and the editor can move their pixels on the screen instead of
++  // redrawing them (see typesetter_rep::find_shift).  Each distance is off
++  // by less than half a pixel; paper mode (and so printing) is unaffected.
++  int i, n= N(bs);
++  for (i=0; i<n-1; i++) {
++    SI d = bs[i]->y1 - spc[i] - bs[i+1]->y2;
++    SI rd= snap * ((SI) tm_round (((double) d) / snap));
++    spc[i] += d - rd;
++  }
++}
++
+ void
+ shove_cache_new_pass () {
+   shove_prev= shove_cur;
+diff --git a/src/Typeset/Stack/stacker.hpp b/src/Typeset/Stack/stacker.hpp
+index 20516377f..d9ac7e7bd 100644
+--- a/src/Typeset/Stack/stacker.hpp
++++ b/src/Typeset/Stack/stacker.hpp
+@@ -64,6 +64,7 @@ array<page_item> typeset_stack (edit_env env, tree t, path ip,
+ void merge_stack (array<page_item>& l, stack_border& sb,
+ 		  array<page_item> l2, stack_border sb2);
+ 
++void snap_stack_spacing (array<box> bs, array<SI>& spc, SI snap);
+ void shove_cache_new_pass ();
+ void shove_cache_end_pass ();
+ 
+-- 
+2.53.0
+

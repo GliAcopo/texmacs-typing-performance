@@ -1,0 +1,169 @@
+From 5435ff662a629d3baadd2180e42a97828d84dca8 Mon Sep 17 00:00:00 2001
+From: Gli_acopo <82150202+GliAcopo@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 18:01:24 +0200
+Subject: [PATCH 2/5] do not retypeset the whole rest of a document when a
+ paragraph is removed
+
+When a removed paragraph had changed the environment (a section, a
+label, a numbered environment...), all following paragraphs were marked
+for retypesetting, so that joining two paragraphs next to a heading cost
+3 to 5 s in a 3,500 paragraph document.  Instead, the next paragraph
+records the changes which the removed ones made at the previous pass,
+and they are added to the old patch of the typesetter just before it is
+typeset (edit_env_rep::removed_update): the usual comparison with the
+previous pass then retypesets the following paragraphs as long as the
+environment differs from it, and no further.  Blocks containing such a
+paragraph are not replayed.  Documents with an accumulator keep the old
+behaviour.
+---
+ src/Typeset/Bridge/bridge.cpp          |  4 ++-
+ src/Typeset/Bridge/bridge.hpp          |  1 +
+ src/Typeset/Bridge/bridge_document.cpp | 36 +++++++++++++++++++++++---
+ src/Typeset/Env/env.cpp                |  9 +++++++
+ src/Typeset/env.hpp                    |  1 +
+ 5 files changed, 46 insertions(+), 5 deletions(-)
+
+diff --git a/src/Typeset/Bridge/bridge.cpp b/src/Typeset/Bridge/bridge.cpp
+index 8d5a43660..67392b2be 100644
+--- a/src/Typeset/Bridge/bridge.cpp
++++ b/src/Typeset/Bridge/bridge.cpp
+@@ -38,7 +38,8 @@ bridge nil_bridge;
+ 
+ bridge_rep::bridge_rep (typesetter ttt2, tree st2, path ip2):
+   ttt (ttt2), env (ttt->env), st (st2), ip (ip2),
+-  status (CORRUPTED), changes (UNINIT), stack_cache_ok (false), version (0),
++  status (CORRUPTED), changes (UNINIT), removed (UNINIT),
++  stack_cache_ok (false), version (0),
+   chunk_cache (NULL) {}
+ 
+ static tree inactive_auto
+@@ -140,6 +141,7 @@ void
+ replace_bridge (bridge& br, tree st, path ip) {
+   bridge new_br= make_bridge (br->ttt, st, ip);
+   new_br->changes= br->changes;
++  new_br->removed= br->removed;
+   br= new_br;
+ }
+ 
+diff --git a/src/Typeset/Bridge/bridge.hpp b/src/Typeset/Bridge/bridge.hpp
+index d8af0eabe..18ef6b9d3 100644
+--- a/src/Typeset/Bridge/bridge.hpp
++++ b/src/Typeset/Bridge/bridge.hpp
+@@ -41,6 +41,7 @@ public:
+   path                 ip;       // source location of the paragraph
+   int                  status;   // status among above values
+   hashmap<string,tree> changes;  // changes in the environment
++  hashmap<string,tree> removed;  // changes of paragraphs removed just before
+ 
+   array<page_item>     l;        // the typesetted lines of st
+   stack_border         sb;       // border properties of l
+diff --git a/src/Typeset/Bridge/bridge_document.cpp b/src/Typeset/Bridge/bridge_document.cpp
+index 894000bb9..b1a1878ce 100644
+--- a/src/Typeset/Bridge/bridge_document.cpp
++++ b/src/Typeset/Bridge/bridge_document.cpp
+@@ -100,6 +100,16 @@ public:
+   void my_typeset (int desired_status);
+ };
+ 
++static void
++compose_changes (hashmap<string,tree>& h, hashmap<string,tree> later) {
++  // h followed by later
++  iterator<string> it= iterate (later);
++  while (it->busy ()) {
++    string var= it->next ();
++    h (var)= later [var];
++  }
++}
++
+ bridge_document_rep::bridge_document_rep (typesetter ttt, tree st, path ip):
+   bridge_rep (ttt, st, ip)
+ {
+@@ -191,16 +201,30 @@ bridge_document_rep::notify_remove (path p, int nr) {
+       brs2[i]->ip->item -= nr;
+     }
+     bool change_flag= false;
+-    for (i=pos; i<pos+nr; i++)
+-      change_flag |= !brs[i]->changes->empty();
++    hashmap<string,tree> gone (UNINIT);
++    for (i=pos; i<pos+nr; i++) {
++      change_flag |= !brs[i]->changes->empty() || !brs[i]->removed->empty();
++      compose_changes (gone, brs[i]->removed);
++      compose_changes (gone, brs[i]->changes);
++    }
+     brs= brs2;
+     n -= nr;
+     st = st (0, pos) * st (pos+nr, N(st));
+     if (pos>0) brs[pos-1]->notify_change (); // touch in case of surroundings
+     if (pos<n) brs[pos  ]->notify_change (); // touch in case of surroundings
+-    if (change_flag) // touch brs[pos..n] for correct ``changes handling''
++    if (change_flag && !is_nil (acc))
++      // touch brs[pos..n] for correct ``changes handling''
+       for (i=pos; i<n; i++)
+ 	brs[i]->notify_change ();
++    else if (change_flag && pos<n) {
++      // Instead of retypesetting all following paragraphs, tell the next
++      // one which changes of the environment it saw at the previous pass
++      // (see typeset_one): the usual comparison of the environments with
++      // the previous pass then retypesets the paragraphs which follow as
++      // long as the environment differs, and no further.
++      compose_changes (gone, brs[pos]->removed);
++      brs[pos]->removed= gone;
++    }
+     if (!is_nil (acc)) acc->notify_remove (p, nr);
+     // initialize_acc ();
+   }
+@@ -266,6 +290,10 @@ bridge_document_rep::typeset_one (int i, int n, int desired_status,
+   int wanted= (i==n-1? desired_status & WANTED_MASK: WANTED_PARAGRAPH);
+   ttt->a= (i==0  ? a: array<line_item> ());
+   ttt->b= (i==n-1? b: array<line_item> ());
++  if (!brs[i]->removed->empty ()) {
++    env->removed_update (ttt->old_patch, brs[i]->removed);
++    brs[i]->removed= hashmap<string,tree> (UNINIT);
++  }
+   brs[i]->typeset (PROCESSED+ wanted);
+ }
+ 
+@@ -277,7 +305,7 @@ bridge_document_rep::replay_tail (doc_run& run, int s, int e) {
+   for (int k= s; k < e; k++) {
+     bridge_rep* br= brs[k].operator-> ();
+     if (run.brs[k-s].operator-> () != br || run.vers[k-s] != br->version ||
+-        br->status != PROCESSED + WANTED_PARAGRAPH)
++        br->status != PROCESSED + WANTED_PARAGRAPH || !br->removed->empty ())
+       return false;
+   }
+   int idx= last_line_item (ttt->l);
+diff --git a/src/Typeset/Env/env.cpp b/src/Typeset/Env/env.cpp
+index 3b72fb476..351d25586 100644
+--- a/src/Typeset/Env/env.cpp
++++ b/src/Typeset/Env/env.cpp
+@@ -207,6 +207,15 @@ edit_env_rep::local_update (hashmap<string,tree>& old_patch,
+   change= invert (back, env);
+ }
+ 
++void
++edit_env_rep::removed_update (hashmap<string,tree>& old_patch,
++                              hashmap<string,tree> change)
++{
++  // paragraphs with the changes change were removed just before the current
++  // point: at the previous pass, the environment here was patched by them
++  old_patch->post_patch (change, env);
++}
++
+ void
+ edit_env_rep::local_end (hashmap<string,tree>& prev_back) {
+   int i=0, n=back->n;
+diff --git a/src/Typeset/env.hpp b/src/Typeset/env.hpp
+index 3f29618d0..fc987f7c9 100644
+--- a/src/Typeset/env.hpp
++++ b/src/Typeset/env.hpp
+@@ -483,6 +483,7 @@ public:
+   void read_env (hashmap<string,tree>& ret);
+   void local_start (hashmap<string,tree>& prev_back);
+   void local_update (hashmap<string,tree>& oldpat, hashmap<string,tree>& chg);
++  void removed_update (hashmap<string,tree>& oldpat, hashmap<string,tree> chg);
+   void local_end (hashmap<string,tree>& prev_back);
+ 
+   /* updating environment variables */
+-- 
+2.53.0
+
